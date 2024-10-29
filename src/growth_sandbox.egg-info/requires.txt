@@ -1,0 +1,13 @@
+fenics-dolfinx
+scifem
+
+[dev]
+pdbpp
+ipython
+bump2version
+pre-commit
+
+[test]
+pytest
+pytest-cov
+cardiac-geometriesx
