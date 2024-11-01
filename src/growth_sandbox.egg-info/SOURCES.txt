@@ -1,9 +1,0 @@
-LICENSE
-pyproject.toml
-src/growth/__init__.py
-src/growth/models.py
-src/growth_sandbox.egg-info/PKG-INFO
-src/growth_sandbox.egg-info/SOURCES.txt
-src/growth_sandbox.egg-info/dependency_links.txt
-src/growth_sandbox.egg-info/requires.txt
-src/growth_sandbox.egg-info/top_level.txt
