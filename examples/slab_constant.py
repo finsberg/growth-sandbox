@@ -4,6 +4,7 @@ from pathlib import Path
 from mpi4py import MPI
 
 import basix
+import cardiac_geometries
 import dolfinx
 import numpy as np
 import scifem
@@ -12,37 +13,50 @@ from dolfinx import log
 from dolfinx.fem.petsc import NonlinearProblem
 from dolfinx.nls.petsc import NewtonSolver
 
-from growth import KOM
+from growth import ConstantGrowthTensor
 
 
 def main():
     log.set_log_level(log.LogLevel.INFO)
 
     comm = MPI.COMM_WORLD
-    mesh = dolfinx.mesh.create_unit_cube(
-        comm=comm,
-        cell_type=dolfinx.mesh.CellType.tetrahedron,
-        nx=3,
-        ny=3,
-        nz=3,
+    geodir = Path("slab")
+    if not geodir.exists():
+        comm.barrier()
+        cardiac_geometries.mesh.slab(
+            comm=comm,
+            lx=1.0,
+            ly=1.0,
+            lz=1.0,
+            dx=0.5,
+            outdir=geodir,
+            create_fibers=True,
+            fiber_space="Quadrature_4",
+            fiber_angle_endo=60,
+            fiber_angle_epi=-60,
+        )
+
+    # If the folder already exist, then we just load the geometry
+
+    geo = cardiac_geometries.geometry.Geometry.from_folder(
+        comm=MPI.COMM_WORLD,
+        folder=geodir,
     )
 
-    with dolfinx.io.XDMFFile(comm, "mesh.xdmf", "w") as file:
-        file.write_mesh(mesh)
-
-    V = dolfinx.fem.functionspace(mesh, ("P", 2, (3,)))
+    V = dolfinx.fem.functionspace(geo.mesh, ("P", 2, (3,)))
     u = dolfinx.fem.Function(V)
     v = ufl.TestFunction(V)
 
-    mu = dolfinx.fem.Constant(mesh, 10.0)
-    kappa = dolfinx.fem.Constant(mesh, 1e4)
+    mu = dolfinx.fem.Constant(geo.mesh, 10.0)
+    kappa = dolfinx.fem.Constant(geo.mesh, 1e4)
 
-    f0 = ufl.as_vector([1, 0, 0])
-    s0 = ufl.as_vector([0, 1, 0])
-    n0 = ufl.as_vector([0, 0, 1])
+    f0 = geo.f0
+    s0 = geo.s0
+    n0 = geo.n0
+    mesh = geo.mesh
 
     F = ufl.variable(ufl.grad(u) + ufl.Identity(3))
-    Fg = KOM(mesh, f0, s0, n0)
+    Fg = ConstantGrowthTensor(geo.mesh, f0, s0, n0)
     Fe = F * ufl.inv(Fg.tensor)
 
     C = Fe.T * Fe
@@ -62,43 +76,33 @@ def main():
 
     P = ufl.diff(psi, F)
 
-    L = 1.0
-
-    fdim = mesh.topology.dim - 1
-    x0_facets = dolfinx.mesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[0], 0))
-    x1_facets = dolfinx.mesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[0], L))
-    y0_facets = dolfinx.mesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[1], 0))
-    z0_facets = dolfinx.mesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[2], 0))
-
-    # Concatenate and sort the arrays based on facet indices.
-    # Left facets marked with 1, right facets with two
-    marked_facets = np.hstack([x0_facets, x1_facets, y0_facets, z0_facets])
-
-    marked_values = np.hstack(
-        [
-            np.full_like(x0_facets, 1),
-            np.full_like(x1_facets, 2),
-            np.full_like(y0_facets, 3),
-            np.full_like(z0_facets, 4),
-        ],
-    )
-    sorted_facets = np.argsort(marked_facets)
-
-    facet_tag = dolfinx.mesh.meshtags(
-        mesh,
-        fdim,
-        marked_facets[sorted_facets],
-        marked_values[sorted_facets],
-    )
+    facet_tag = geo.ffun
+    markers = geo.markers
 
     V0, _ = V.sub(0).collapse()
     u_right = dolfinx.fem.Function(V0)
     zero = dolfinx.fem.Function(V0)
 
-    x0_dofs = dolfinx.fem.locate_dofs_topological((V.sub(0), V0), facet_tag.dim, facet_tag.find(1))
-    x1_dofs = dolfinx.fem.locate_dofs_topological((V.sub(0), V0), facet_tag.dim, facet_tag.find(2))
-    y0_dofs = dolfinx.fem.locate_dofs_topological((V.sub(1), V0), facet_tag.dim, facet_tag.find(3))
-    z0_dofs = dolfinx.fem.locate_dofs_topological((V.sub(2), V0), facet_tag.dim, facet_tag.find(4))
+    x0_dofs = dolfinx.fem.locate_dofs_topological(
+        (V.sub(0), V0),
+        facet_tag.dim,
+        facet_tag.find(markers["X0"][0]),
+    )
+    x1_dofs = dolfinx.fem.locate_dofs_topological(
+        (V.sub(0), V0),
+        facet_tag.dim,
+        facet_tag.find(markers["X1"][0]),
+    )
+    y0_dofs = dolfinx.fem.locate_dofs_topological(
+        (V.sub(1), V0),
+        facet_tag.dim,
+        facet_tag.find(markers["Y0"][0]),
+    )
+    z0_dofs = dolfinx.fem.locate_dofs_topological(
+        (V.sub(2), V0),
+        facet_tag.dim,
+        facet_tag.find(markers["Z0"][0]),
+    )
 
     bcs = [
         dolfinx.fem.dirichletbc(zero, x0_dofs, V.sub(0)),
@@ -119,9 +123,9 @@ def main():
     solver.rtol = 1e-8
     solver.convergence_criterion = "incremental"
 
-    disp_file = "results_disp_unit_cube_KOM.bp"
-    strain_file_init = Path("results_strain_unit_cube_KOM_init.xdmf")
-    strain_file_end = Path("results_strain_unit_cube_KOM_end.xdmf")
+    disp_file = "results_disp_slab_constant.bp"
+    strain_file_init = Path("results_strain_slab_constant_init.xdmf")
+    strain_file_end = Path("results_strain_slab_constant_end.xdmf")
     shutil.rmtree(disp_file, ignore_errors=True)
     strain_file_init.unlink(missing_ok=True)
     strain_file_init.with_suffix(".h5").unlink(missing_ok=True)
@@ -150,14 +154,12 @@ def main():
     print("J = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(J * dx)))
     print("Jg = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Jg * dx)))
     print("Je = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Je * dx)))
-
     Exx.interpolate(
         dolfinx.fem.Expression(
             ufl.inner(E * f0, f0),
             Exx.function_space.element.interpolation_points(),
         ),
     )
-
     Eyy.interpolate(
         dolfinx.fem.Expression(
             ufl.inner(E * s0, s0),
@@ -168,35 +170,29 @@ def main():
     vtx.write(1.0)
     scifem.xdmf.create_pointcloud(strain_file_init, [Exx, Eyy])
 
-    N = 50
-    for i in range(2, N + 2):
-        Fg.apply_stimulus(u)
-
+    # Just set the value of theta_f to 1.5
+    for value in np.linspace(1.0, 1.05, 100):
+        print(value)
+        Fg.theta_f.value = value
         solver.solve(u)
-        print("J = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(J * dx)))
-        print("Jg = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Jg * dx)))
-        print("Je = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Je * dx)))
+    print("J = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(J * dx)))
+    print("Jg = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Jg * dx)))
+    print("Je = ", dolfinx.fem.assemble_scalar(dolfinx.fem.form(Je * dx)))
 
-        Exx.interpolate(
-            dolfinx.fem.Expression(
-                ufl.inner(E * f0, f0),
-                Exx.function_space.element.interpolation_points(),
-            ),
-        )
-        Eyy.interpolate(
-            dolfinx.fem.Expression(
-                ufl.inner(E * s0, s0),
-                Eyy.function_space.element.interpolation_points(),
-            ),
-        )
+    Exx.interpolate(
+        dolfinx.fem.Expression(
+            ufl.inner(E * f0, f0),
+            Exx.function_space.element.interpolation_points(),
+        ),
+    )
+    Eyy.interpolate(
+        dolfinx.fem.Expression(
+            ufl.inner(E * s0, s0),
+            Eyy.function_space.element.interpolation_points(),
+        ),
+    )
 
-        vtx.write(i)
-
-        change = Fg.change()
-        print("Change = ", change)
-        if change < 1e-12:
-            break
-
+    vtx.write(2.0)
     scifem.xdmf.create_pointcloud(strain_file_end, [Exx, Eyy])
 
 
